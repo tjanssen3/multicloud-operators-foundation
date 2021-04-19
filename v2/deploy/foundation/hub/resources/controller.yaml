@@ -1,0 +1,37 @@
+kind: Deployment
+apiVersion: apps/v1
+metadata:
+  name: foundation-controller
+  namespace: open-cluster-management
+  labels:
+    app: foundation-controller
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: foundation-controller
+  template:
+    metadata:
+      labels:
+        app: foundation-controller
+    spec:
+      serviceAccountName: foundation-hub-sa
+      containers:
+      - name: foundation-controller
+        image: foundation-controller
+        imagePullPolicy: IfNotPresent
+        args:
+          - "/controller"
+          - "--enable-rbac=true"
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8000
+          failureThreshold: 3
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 8000
+          failureThreshold: 3
+          periodSeconds: 10
