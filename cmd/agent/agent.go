@@ -7,7 +7,9 @@ import (
 	"os"
 	"time"
 
+	"github.com/open-cluster-management/addon-framework/pkg/lease"
 	clusterclientset "github.com/open-cluster-management/api/client/cluster/clientset/versioned"
+	clusterinformers "github.com/open-cluster-management/api/client/cluster/informers/externalversions"
 	clusterv1alpha1 "github.com/open-cluster-management/api/cluster/v1alpha1"
 	"github.com/open-cluster-management/multicloud-operators-foundation/cmd/agent/app"
 	"github.com/open-cluster-management/multicloud-operators-foundation/cmd/agent/app/options"
@@ -17,15 +19,15 @@ import (
 	actionctrl "github.com/open-cluster-management/multicloud-operators-foundation/pkg/klusterlet/action"
 	clusterclaimctl "github.com/open-cluster-management/multicloud-operators-foundation/pkg/klusterlet/clusterclaim"
 	clusterinfoctl "github.com/open-cluster-management/multicloud-operators-foundation/pkg/klusterlet/clusterinfo"
-	leasectrl "github.com/open-cluster-management/multicloud-operators-foundation/pkg/klusterlet/lease"
+	"github.com/open-cluster-management/multicloud-operators-foundation/pkg/klusterlet/nodecollector"
 	viewctrl "github.com/open-cluster-management/multicloud-operators-foundation/pkg/klusterlet/view"
+	"github.com/open-cluster-management/multicloud-operators-foundation/pkg/utils"
 	restutils "github.com/open-cluster-management/multicloud-operators-foundation/pkg/utils/rest"
 	routev1 "github.com/openshift/client-go/route/clientset/versioned"
 	"github.com/spf13/pflag"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/util/wait"
-	cacheddiscovery "k8s.io/client-go/discovery/cached"
 	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	_ "k8s.io/client-go/plugin/pkg/client/auth" // Needed for misc auth.
@@ -33,6 +35,7 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/leaderelection"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	ctrlruntimelog "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/manager/signals"
@@ -63,11 +66,11 @@ func main() {
 	o := options.NewAgentOptions()
 	o.AddFlags(pflag.CommandLine)
 
-	stopCh := signals.SetupSignalHandler()
-	startManager(o, stopCh)
+	ctx := signals.SetupSignalHandler()
+	startManager(o, ctx)
 }
 
-func startManager(o *options.AgentOptions, stopCh <-chan struct{}) {
+func startManager(o *options.AgentOptions, ctx context.Context) {
 	hubConfig, err := clientcmd.BuildConfigFromFlags("", o.HubKubeConfig)
 	if err != nil {
 		setupLog.Error(err, "Unable to get hub kube config.")
@@ -93,16 +96,25 @@ func startManager(o *options.AgentOptions, stopCh <-chan struct{}) {
 		setupLog.Error(err, "New route client config error:")
 	}
 
-	managedClusterClient, err := kubernetes.NewForConfig(managedClusterConfig)
-	if err != nil {
-		setupLog.Error(err, "Unable to create managed cluster clientset.")
-		os.Exit(1)
-	}
-
 	managedClusterClusterClient, err := clusterclientset.NewForConfig(managedClusterConfig)
 	if err != nil {
 		setupLog.Error(err, "Unable to create managed cluster cluster clientset.")
 		os.Exit(1)
+	}
+
+	restMapper, err := apiutil.NewDynamicRESTMapper(managedClusterConfig, apiutil.WithLazyDiscovery)
+	if err != nil {
+		setupLog.Error(err, "Unable to create restmapper.")
+		os.Exit(1)
+	}
+
+	componentNamespace := o.ComponentNamespace
+	if len(componentNamespace) == 0 {
+		componentNamespace, err = utils.GetComponentNamespace()
+		if err != nil {
+			setupLog.Error(err, "Failed to get pod namespace")
+			os.Exit(1)
+		}
 	}
 
 	mgr, err := ctrl.NewManager(hubConfig, ctrl.Options{
@@ -116,28 +128,29 @@ func startManager(o *options.AgentOptions, stopCh <-chan struct{}) {
 		os.Exit(1)
 	}
 
-	go app.ServeHealthProbes(stopCh, ":8000")
-
-	leaseReconciler := leasectrl.LeaseReconciler{
-		KubeClient:           managedClusterKubeClient,
-		LeaseName:            AddonName,
-		LeaseDurationSeconds: int32(o.LeaseDurationSeconds),
-	}
-
-	go wait.JitterUntilWithContext(context.TODO(), leaseReconciler.Reconcile, time.Duration(o.LeaseDurationSeconds)*time.Second, leaseUpdateJitterFactor, true)
+	go app.ServeHealthProbes(ctx.Done(), ":8000")
 
 	run := func(ctx context.Context) {
 		// run agent server
-		agent, err := app.AgentServerRun(o, managedClusterClient)
+		agent, err := app.AgentServerRun(o, managedClusterKubeClient)
 		if err != nil {
 			setupLog.Error(err, "unable to run agent server")
 			os.Exit(1)
 		}
 
-		// run mapper
-		discoveryClient := cacheddiscovery.NewMemCacheClient(managedClusterClient.Discovery())
-		mapper := restutils.NewMapper(discoveryClient, stopCh)
-		mapper.Run()
+		kubeInformerFactory := informers.NewSharedInformerFactory(managedClusterKubeClient, 10*time.Minute)
+		clusterInformerFactory := clusterinformers.NewSharedInformerFactory(managedClusterClusterClient, 10*time.Minute)
+
+		resourceCollector := nodecollector.NewCollector(
+			kubeInformerFactory.Core().V1().Nodes(),
+			managedClusterKubeClient,
+			mgr.GetClient(),
+			o.ClusterName,
+			componentNamespace)
+		go resourceCollector.Start(ctx)
+
+		leaseUpdater := lease.NewLeaseUpdater(managedClusterKubeClient, AddonName, componentNamespace)
+		go leaseUpdater.Start(ctx)
 
 		// Add controller into manager
 		actionReconciler := actionctrl.NewActionReconciler(
@@ -145,7 +158,7 @@ func startManager(o *options.AgentOptions, stopCh <-chan struct{}) {
 			ctrl.Log.WithName("controllers").WithName("ManagedClusterAction"),
 			mgr.GetScheme(),
 			managedClusterDynamicClient,
-			restutils.NewKubeControl(mapper, managedClusterConfig),
+			restutils.NewKubeControl(restMapper, managedClusterConfig),
 			o.EnableImpersonation,
 		)
 		viewReconciler := &viewctrl.ViewReconciler{
@@ -153,16 +166,19 @@ func startManager(o *options.AgentOptions, stopCh <-chan struct{}) {
 			Log:                         ctrl.Log.WithName("controllers").WithName("ManagedClusterView"),
 			Scheme:                      mgr.GetScheme(),
 			ManagedClusterDynamicClient: managedClusterDynamicClient,
-			Mapper:                      mapper,
+			Mapper:                      restMapper,
 		}
 
 		clusterInfoReconciler := clusterinfoctl.ClusterInfoReconciler{
 			Client:                      mgr.GetClient(),
 			Log:                         ctrl.Log.WithName("controllers").WithName("ManagedClusterInfo"),
 			Scheme:                      mgr.GetScheme(),
+			NodeLister:                  kubeInformerFactory.Core().V1().Nodes().Lister(),
+			NodeInformer:                kubeInformerFactory.Core().V1().Nodes(),
+			ClaimInformer:               clusterInformerFactory.Cluster().V1alpha1().ClusterClaims(),
+			ClaimLister:                 clusterInformerFactory.Cluster().V1alpha1().ClusterClaims().Lister(),
 			KubeClient:                  managedClusterKubeClient,
 			ManagedClusterDynamicClient: managedClusterDynamicClient,
-			ClusterClient:               managedClusterClusterClient,
 			ClusterName:                 o.ClusterName,
 			AgentRoute:                  o.AgentRoute,
 			AgentAddress:                o.AgentAddress,
@@ -182,6 +198,7 @@ func startManager(o *options.AgentOptions, stopCh <-chan struct{}) {
 		clusterClaimReconciler := clusterclaimctl.ClusterClaimReconciler{
 			Log:               ctrl.Log.WithName("controllers").WithName("ManagedClusterInfo"),
 			ClusterClient:     managedClusterClusterClient,
+			ClusterInfomers:   clusterInformerFactory.Cluster().V1alpha1().ClusterClaims(),
 			ListClusterClaims: clusterClaimer.List,
 		}
 
@@ -205,8 +222,11 @@ func startManager(o *options.AgentOptions, stopCh <-chan struct{}) {
 			os.Exit(1)
 		}
 
+		go kubeInformerFactory.Start(ctx.Done())
+		go clusterInformerFactory.Start(ctx.Done())
+
 		setupLog.Info("starting manager")
-		if err := mgr.Start(stopCh); err != nil {
+		if err := mgr.Start(ctx); err != nil {
 			setupLog.Error(err, "problem running manager")
 			os.Exit(1)
 		}
@@ -217,7 +237,7 @@ func startManager(o *options.AgentOptions, stopCh <-chan struct{}) {
 		panic("unreachable")
 	}
 
-	lec, err := app.NewLeaderElection(scheme, managedClusterClient, run)
+	lec, err := app.NewLeaderElection(scheme, managedClusterKubeClient, run)
 	if err != nil {
 		setupLog.Error(err, "cannot create leader election")
 		os.Exit(1)
