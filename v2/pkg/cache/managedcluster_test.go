@@ -1,9 +1,13 @@
 package cache
 
 import (
+	"testing"
+	"time"
+
 	clusterfake "github.com/open-cluster-management/api/client/cluster/clientset/versioned/fake"
 	clusterv1informers "github.com/open-cluster-management/api/client/cluster/informers/externalversions"
 	clusterv1 "github.com/open-cluster-management/api/cluster/v1"
+	"github.com/open-cluster-management/multicloud-operators-foundation/pkg/utils"
 	"github.com/stretchr/testify/assert"
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -12,8 +16,6 @@ import (
 	"k8s.io/apiserver/pkg/authentication/user"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes/fake"
-	"testing"
-	"time"
 )
 
 var (
@@ -215,6 +217,7 @@ func fakeNewClusterCache(stopCh chan struct{}) *ClusterCache {
 		clusterInformers.Cluster().V1().ManagedClusters(),
 		informers.Rbac().V1().ClusterRoles(),
 		informers.Rbac().V1().ClusterRoleBindings(),
+		utils.GetViewResourceFromClusterRole,
 	)
 
 }

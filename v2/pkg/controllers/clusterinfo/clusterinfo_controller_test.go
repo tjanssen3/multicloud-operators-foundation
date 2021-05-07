@@ -1,6 +1,7 @@
 package clusterinfo
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"sync"
@@ -72,17 +73,17 @@ func TestMain(m *testing.M) {
 }
 
 // StartTestManager adds recFn
-func StartTestManager(mgr manager.Manager, g *gomega.GomegaWithT) (chan struct{}, *sync.WaitGroup) {
-	stop := make(chan struct{})
+func StartTestManager(mgr manager.Manager, g *gomega.GomegaWithT) (context.CancelFunc, *sync.WaitGroup) {
+	ctx, cancel := context.WithCancel(context.Background())
 	wg := &sync.WaitGroup{}
 	wg.Add(1)
 
 	go func() {
 		defer wg.Done()
-		g.Expect(mgr.Start(stop)).NotTo(gomega.HaveOccurred())
+		g.Expect(mgr.Start(ctx)).NotTo(gomega.HaveOccurred())
 	}()
 
-	return stop, wg
+	return cancel, wg
 }
 
 func TestControllerReconcile(t *testing.T) {
@@ -97,10 +98,10 @@ func TestControllerReconcile(t *testing.T) {
 
 	SetupWithManager(mgr, []byte(""))
 
-	stopMgr, mgrStopped := StartTestManager(mgr, g)
+	cancel, mgrStopped := StartTestManager(mgr, g)
 
 	defer func() {
-		close(stopMgr)
+		cancel()
 		mgrStopped.Wait()
 	}()
 
@@ -115,8 +116,8 @@ func validateError(t *testing.T, err, expectedErrorType error) {
 	}
 }
 
-func newTestReconciler(existingObjs []runtime.Object) *Reconciler {
-	return &Reconciler{
+func newTestClusterInfoReconciler(existingObjs []runtime.Object) *ClusterInfReconciler {
+	return &ClusterInfReconciler{
 		client: fake.NewFakeClientWithScheme(scheme, existingObjs...),
 		scheme: scheme,
 		caData: []byte{},
@@ -124,6 +125,7 @@ func newTestReconciler(existingObjs []runtime.Object) *Reconciler {
 }
 
 func TestReconcile(t *testing.T) {
+	ctx := context.Background()
 	tests := []struct {
 		name              string
 		existingObjs      []runtime.Object
@@ -141,7 +143,7 @@ func TestReconcile(t *testing.T) {
 			},
 		},
 		{
-			name: "ManagedClusterHasFinalizerWithoutClusterInfo",
+			name: "TerminatingManagedClusterHasFinalizerWithoutClusterInfo",
 			existingObjs: []runtime.Object{
 				&clusterv1.ManagedCluster{
 					ObjectMeta: metav1.ObjectMeta{
@@ -168,6 +170,9 @@ func TestReconcile(t *testing.T) {
 				&clusterv1.ManagedCluster{
 					ObjectMeta: metav1.ObjectMeta{
 						Name: ManagedClusterName,
+						Finalizers: []string{
+							clusterFinalizerName,
+						},
 					},
 					Spec: clusterv1.ManagedClusterSpec{
 						ManagedClusterClientConfigs: []clusterv1.ClientConfig{
@@ -185,7 +190,7 @@ func TestReconcile(t *testing.T) {
 					Name: ManagedClusterName,
 				},
 			},
-			requeue: true,
+			requeue: false,
 		},
 		{
 			name: "ManagedClusterNoFinalizerWithClusterInfo",
@@ -221,8 +226,8 @@ func TestReconcile(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			svrc := newTestReconciler(test.existingObjs)
-			res, err := svrc.Reconcile(test.req)
+			svrc := newTestClusterInfoReconciler(test.existingObjs)
+			res, err := svrc.Reconcile(ctx, test.req)
 			validateError(t, err, test.expectedErrorType)
 			if test.requeue {
 				assert.Equal(t, res.Requeue, true)

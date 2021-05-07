@@ -4,11 +4,10 @@ import (
 	"context"
 	"fmt"
 	"reflect"
-	"time"
 
 	"github.com/go-logr/logr"
 	clusterclientset "github.com/open-cluster-management/api/client/cluster/clientset/versioned"
-	clusterinformers "github.com/open-cluster-management/api/client/cluster/informers/externalversions"
+	clusterv1alpha1informer "github.com/open-cluster-management/api/client/cluster/informers/externalversions/cluster/v1alpha1"
 	clusterv1alpha1 "github.com/open-cluster-management/api/cluster/v1alpha1"
 	"github.com/open-cluster-management/multicloud-operators-foundation/pkg/utils"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -31,14 +30,15 @@ type ClusterClaimReconciler struct {
 	Log               logr.Logger
 	ListClusterClaims ListClusterClaimsFunc
 	ClusterClient     clusterclientset.Interface
+	ClusterInfomers   clusterv1alpha1informer.ClusterClaimInformer
 }
 
-func (r *ClusterClaimReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
-	err := r.syncClaims()
+func (r *ClusterClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	err := r.syncClaims(ctx)
 	return ctrl.Result{}, err
 }
 
-func (r *ClusterClaimReconciler) syncClaims() error {
+func (r *ClusterClaimReconciler) syncClaims(ctx context.Context) error {
 	r.Log.V(4).Info("Sync cluster claims")
 	claims, err := r.ListClusterClaims()
 	if err != nil {
@@ -47,18 +47,18 @@ func (r *ClusterClaimReconciler) syncClaims() error {
 
 	errs := []error{}
 	for _, claim := range claims {
-		if err := r.createOrUpdate(claim); err != nil {
+		if err := r.createOrUpdate(ctx, claim); err != nil {
 			errs = append(errs, err)
 		}
 	}
 	return utils.NewMultiLineAggregate(errs)
 }
 
-func (r *ClusterClaimReconciler) createOrUpdate(newClaim *clusterv1alpha1.ClusterClaim) error {
-	oldClaim, err := r.ClusterClient.ClusterV1alpha1().ClusterClaims().Get(context.Background(), newClaim.Name, metav1.GetOptions{})
+func (r *ClusterClaimReconciler) createOrUpdate(ctx context.Context, newClaim *clusterv1alpha1.ClusterClaim) error {
+	oldClaim, err := r.ClusterClient.ClusterV1alpha1().ClusterClaims().Get(ctx, newClaim.Name, metav1.GetOptions{})
 	switch {
 	case errors.IsNotFound(err):
-		_, err := r.ClusterClient.ClusterV1alpha1().ClusterClaims().Create(context.Background(), newClaim, metav1.CreateOptions{})
+		_, err := r.ClusterClient.ClusterV1alpha1().ClusterClaims().Create(ctx, newClaim, metav1.CreateOptions{})
 		if err != nil {
 			return fmt.Errorf("unable to create ClusterClaim: %v, %w", newClaim, err)
 		}
@@ -66,7 +66,7 @@ func (r *ClusterClaimReconciler) createOrUpdate(newClaim *clusterv1alpha1.Cluste
 		return fmt.Errorf("unable to get ClusterClaim %q: %w", newClaim.Name, err)
 	case !reflect.DeepEqual(oldClaim.Spec, newClaim.Spec):
 		oldClaim.Spec = newClaim.Spec
-		_, err := r.ClusterClient.ClusterV1alpha1().ClusterClaims().Update(context.Background(), oldClaim, metav1.UpdateOptions{})
+		_, err := r.ClusterClient.ClusterV1alpha1().ClusterClaims().Update(ctx, oldClaim, metav1.UpdateOptions{})
 		if err != nil {
 			return fmt.Errorf("unable to update ClusterClaim %q: %w", oldClaim.Name, err)
 		}
@@ -75,8 +75,9 @@ func (r *ClusterClaimReconciler) createOrUpdate(newClaim *clusterv1alpha1.Cluste
 }
 
 func (r *ClusterClaimReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	ctx := context.Background()
 	// create or update the claims before controller starts
-	if err := r.syncClaims(); err != nil {
+	if err := r.syncClaims(ctx); err != nil {
 		return err
 	}
 
@@ -86,31 +87,28 @@ func (r *ClusterClaimReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		return err
 	}
 
-	source := newClusterClaimSource(r.ClusterClient)
-	if err := c.Watch(source, &clusterClaimEventHandler{}); err != nil {
+	source := NewClusterClaimSource(r.ClusterInfomers)
+	if err := c.Watch(source, &ClusterClaimEventHandler{}); err != nil {
 		return err
 	}
 	return nil
 }
 
 // newClusterClaimSource returns an event source for cluster claims
-func newClusterClaimSource(clusterClient clusterclientset.Interface) source.Source {
-	informerFactory := clusterinformers.NewSharedInformerFactory(clusterClient, 10*time.Minute)
+func NewClusterClaimSource(clusterInfomers clusterv1alpha1informer.ClusterClaimInformer) source.Source {
 	return &clusterClaimSource{
-		informerFactory: informerFactory,
-		claimInformer:   informerFactory.Cluster().V1alpha1().ClusterClaims().Informer(),
+		claimInformer: clusterInfomers.Informer(),
 	}
 }
 
 // clusterClaimSource is the event source of cluster claims on managed cluster.
 type clusterClaimSource struct {
-	informerFactory clusterinformers.SharedInformerFactory
-	claimInformer   cache.SharedIndexInformer
+	claimInformer cache.SharedIndexInformer
 }
 
 var _ source.SyncingSource = &clusterClaimSource{}
 
-func (s *clusterClaimSource) Start(handler handler.EventHandler, queue workqueue.RateLimitingInterface,
+func (s *clusterClaimSource) Start(ctx context.Context, handler handler.EventHandler, queue workqueue.RateLimitingInterface,
 	predicates ...predicate.Predicate) error {
 	// all predicates are ignored
 	s.claimInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
@@ -128,32 +126,30 @@ func (s *clusterClaimSource) Start(handler handler.EventHandler, queue workqueue
 	return nil
 }
 
-func (s *clusterClaimSource) WaitForSync(stop <-chan struct{}) error {
-	go s.informerFactory.Start(stop)
-
-	if ok := cache.WaitForCacheSync(stop, s.claimInformer.HasSynced); !ok {
+func (s *clusterClaimSource) WaitForSync(ctx context.Context) error {
+	if ok := cache.WaitForCacheSync(ctx.Done(), s.claimInformer.HasSynced); !ok {
 		return fmt.Errorf("Never achieved initial sync")
 	}
 	return nil
 }
 
-// clusterClaimEventHandler maps any event to an empty request
-type clusterClaimEventHandler struct{}
+// ClusterClaimEventHandler maps any event to an empty request
+type ClusterClaimEventHandler struct{}
 
-var _ handler.EventHandler = &clusterClaimEventHandler{}
+var _ handler.EventHandler = &ClusterClaimEventHandler{}
 
-func (e *clusterClaimEventHandler) Create(evt event.CreateEvent, q workqueue.RateLimitingInterface) {
+func (e *ClusterClaimEventHandler) Create(evt event.CreateEvent, q workqueue.RateLimitingInterface) {
 	q.Add(reconcile.Request{})
 }
 
-func (e *clusterClaimEventHandler) Update(evt event.UpdateEvent, q workqueue.RateLimitingInterface) {
+func (e *ClusterClaimEventHandler) Update(evt event.UpdateEvent, q workqueue.RateLimitingInterface) {
 	q.Add(reconcile.Request{})
 }
 
-func (e *clusterClaimEventHandler) Delete(evt event.DeleteEvent, q workqueue.RateLimitingInterface) {
+func (e *ClusterClaimEventHandler) Delete(evt event.DeleteEvent, q workqueue.RateLimitingInterface) {
 	q.Add(reconcile.Request{})
 }
 
-func (e *clusterClaimEventHandler) Generic(evt event.GenericEvent, q workqueue.RateLimitingInterface) {
+func (e *ClusterClaimEventHandler) Generic(evt event.GenericEvent, q workqueue.RateLimitingInterface) {
 	q.Add(reconcile.Request{})
 }

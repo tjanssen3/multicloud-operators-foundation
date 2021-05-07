@@ -3,11 +3,11 @@ package controllers
 import (
 	"context"
 	"fmt"
-	clusterclientset "github.com/open-cluster-management/api/client/cluster/clientset/versioned"
-	"github.com/open-cluster-management/multicloud-operators-foundation/pkg/klusterlet/clusterclaim"
 	"net"
-	"strings"
-	"time"
+
+	clusterv1alpha1informer "github.com/open-cluster-management/api/client/cluster/informers/externalversions/cluster/v1alpha1"
+	clusterv1alpha1lister "github.com/open-cluster-management/api/client/cluster/listers/cluster/v1alpha1"
+	"github.com/open-cluster-management/multicloud-operators-foundation/pkg/klusterlet/clusterclaim"
 
 	"github.com/go-logr/logr"
 	clusterv1beta1 "github.com/open-cluster-management/multicloud-operators-foundation/pkg/apis/internal.open-cluster-management.io/v1beta1"
@@ -19,15 +19,25 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/client-go/dynamic"
+	coreinformers "k8s.io/client-go/informers/core/v1"
 	"k8s.io/client-go/kubernetes"
+	corev1lister "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 )
 
 // ClusterInfoReconciler reconciles a ManagedClusterInfo object
@@ -36,8 +46,11 @@ type ClusterInfoReconciler struct {
 	Log                         logr.Logger
 	Scheme                      *runtime.Scheme
 	KubeClient                  kubernetes.Interface
+	NodeInformer                coreinformers.NodeInformer
+	NodeLister                  corev1lister.NodeLister
+	ClaimInformer               clusterv1alpha1informer.ClusterClaimInformer
+	ClaimLister                 clusterv1alpha1lister.ClusterClaimLister
 	ManagedClusterDynamicClient dynamic.Interface
-	ClusterClient               clusterclientset.Interface
 	RouteV1Client               routev1.Interface
 	ClusterName                 string
 	MasterAddresses             string
@@ -49,12 +62,12 @@ type ClusterInfoReconciler struct {
 	Agent                       *agent.Agent
 }
 
-func (r *ClusterInfoReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
-	ctx := context.Background()
+func (r *ClusterInfoReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := r.Log.WithValues("ManagedClusterInfo", req.NamespacedName)
 
+	request := types.NamespacedName{Namespace: r.ClusterName, Name: r.ClusterName}
 	clusterInfo := &clusterv1beta1.ManagedClusterInfo{}
-	err := r.Get(ctx, req.NamespacedName, clusterInfo)
+	err := r.Get(ctx, request, clusterInfo)
 	if err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
@@ -80,21 +93,12 @@ func (r *ClusterInfoReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error)
 		errs = append(errs, fmt.Errorf("failed to get distribution info, error:%v ", err))
 	}
 
-	// Get nodeList
-	nodeList, err := r.getNodeList()
-	if err != nil {
-		log.Error(err, "Failed to get nodes status")
-		errs = append(errs, fmt.Errorf("failed to get nodes status, error:%v ", err))
-	} else {
-		newStatus.NodeList = nodeList
-	}
-
-	claims, err := r.ClusterClient.ClusterV1alpha1().ClusterClaims().List(context.TODO(), metav1.ListOptions{})
+	claims, err := r.ClaimLister.List(labels.Everything())
 	if err != nil {
 		log.Error(err, "Failed to list claims.")
 		errs = append(errs, fmt.Errorf("failed to list clusterClaims error:%v ", err))
 	}
-	for _, claim := range claims.Items {
+	for _, claim := range claims {
 		value := claim.Spec.Value
 		switch claim.Name {
 		case clusterclaim.ClaimOCMConsoleURL:
@@ -157,7 +161,7 @@ func (r *ClusterInfoReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error)
 
 	r.RefreshAgentServer(clusterInfo)
 
-	return ctrl.Result{RequeueAfter: 60 * time.Minute}, nil
+	return ctrl.Result{}, nil
 }
 
 func (r *ClusterInfoReconciler) readAgentConfig() (*corev1.EndpointAddress, *corev1.EndpointPort, error) {
@@ -313,73 +317,6 @@ func (r *ClusterInfoReconciler) getKubeVendor(product string) (kubeVendor cluste
 	return
 }
 
-const (
-	// LabelNodeRolePrefix is a label prefix for node roles
-	// It's copied over to here until it's merged in core: https://github.com/kubernetes/kubernetes/pull/39112
-	LabelNodeRolePrefix = "node-role.kubernetes.io/"
-
-	// NodeLabelRole specifies the role of a node
-	NodeLabelRole = "kubernetes.io/role"
-
-	// copied from k8s.io/api/core/v1/well_known_label.go
-	LabelZoneFailureDomain  = "failure-domain.beta.kubernetes.io/zone"
-	LabelZoneRegion         = "failure-domain.beta.kubernetes.io/region"
-	LabelInstanceType       = "beta.kubernetes.io/instance-type"
-	LabelInstanceTypeStable = "node.kubernetes.io/instance-type"
-)
-
-func (r *ClusterInfoReconciler) getNodeList() ([]clusterv1beta1.NodeStatus, error) {
-	var nodeList []clusterv1beta1.NodeStatus
-	nodes, err := r.KubeClient.CoreV1().Nodes().List(context.TODO(), metav1.ListOptions{})
-	if err != nil {
-		return nil, err
-	}
-	for _, node := range nodes.Items {
-		nodeStatus := clusterv1beta1.NodeStatus{
-			Name:       node.Name,
-			Labels:     map[string]string{},
-			Capacity:   clusterv1beta1.ResourceList{},
-			Conditions: []clusterv1beta1.NodeCondition{},
-		}
-
-		// The roles are determined by looking for:
-		// * a node-role.kubernetes.io/<role>="" label
-		// * a kubernetes.io/role="<role>" label
-		for k, v := range node.Labels {
-			if strings.HasPrefix(k, LabelNodeRolePrefix) || k == NodeLabelRole ||
-				k == LabelZoneFailureDomain || k == LabelZoneRegion ||
-				k == LabelInstanceType || k == LabelInstanceTypeStable {
-				nodeStatus.Labels[k] = v
-			}
-		}
-
-		// append capacity of cpu and memory
-		for k, v := range node.Status.Capacity {
-			switch {
-			case k == corev1.ResourceCPU:
-				nodeStatus.Capacity[clusterv1beta1.ResourceCPU] = v
-			case k == corev1.ResourceMemory:
-				nodeStatus.Capacity[clusterv1beta1.ResourceMemory] = v
-			}
-		}
-
-		// append condition of NodeReady
-		readyCondition := clusterv1beta1.NodeCondition{
-			Type: corev1.NodeReady,
-		}
-		for _, condition := range node.Status.Conditions {
-			if condition.Type == corev1.NodeReady {
-				readyCondition.Status = condition.Status
-				break
-			}
-		}
-		nodeStatus.Conditions = append(nodeStatus.Conditions, readyCondition)
-
-		nodeList = append(nodeList, nodeStatus)
-	}
-	return nodeList, nil
-}
-
 func (r *ClusterInfoReconciler) isOpenshift() bool {
 	serverGroups, err := r.KubeClient.Discovery().ServerGroups()
 	if err != nil {
@@ -409,36 +346,79 @@ func (r *ClusterInfoReconciler) getOCPDistributionInfo() (clusterv1beta1.OCPDist
 
 	ocpDistributionInfo.DesiredVersion, _, err = unstructured.NestedString(obj.Object, "status", "desired", "version")
 	if err != nil {
-		klog.Errorf("failed to get OCP cluster version in latest history of status: %v", err)
+		klog.Errorf("failed to get OCP desired version in clusterVersion: %v", err)
 	}
 	availableUpdates, _, err := unstructured.NestedSlice(obj.Object, "status", "availableUpdates")
 	if err != nil {
-		klog.Errorf("failed to get OCP cluster version in latest history of status: %v", err)
+		klog.Errorf("failed to get OCP availableUpdates in clusterVersion: %v", err)
 	}
 	for _, update := range availableUpdates {
-		availableVersion, _, err := unstructured.NestedString(update.(map[string]interface{}), "version")
+		versionUpdate := clusterv1beta1.OCPVersionRelease{}
+		versionUpdate.Version, _, err = unstructured.NestedString(update.(map[string]interface{}), "version")
 		if err != nil {
-			klog.Errorf("failed to get OCP cluster version in latest history of status: %v", err)
-			continue
+			klog.Errorf("failed to get version in availableUpdates of clusterVersion: %v", err)
 		}
-		ocpDistributionInfo.AvailableUpdates = append(ocpDistributionInfo.AvailableUpdates, availableVersion)
+		versionUpdate.Image, _, err = unstructured.NestedString(update.(map[string]interface{}), "image")
+		if err != nil {
+			klog.Errorf("failed to get image in availableUpdates of clusterVersion: %v", err)
+		}
+		versionUpdate.URL, _, err = unstructured.NestedString(update.(map[string]interface{}), "url")
+		if err != nil {
+			klog.Errorf("failed to get url in availableUpdates of clusterVersion: %v", err)
+		}
+		versionUpdate.Channels, _, err = unstructured.NestedStringSlice(update.(map[string]interface{}), "channels")
+		if err != nil {
+			klog.Errorf("failed to get url in availableUpdates of clusterVersion: %v", err)
+		}
+		if versionUpdate.Version != "" {
+			// ocpDistributionInfo.AvailableUpdates is deprecated in release 2.3 and will be removed in the future.
+			// Use VersionAvailableUpdates instead.
+			ocpDistributionInfo.AvailableUpdates = append(ocpDistributionInfo.AvailableUpdates, versionUpdate.Version)
+			ocpDistributionInfo.VersionAvailableUpdates = append(ocpDistributionInfo.VersionAvailableUpdates, versionUpdate)
+		}
+
+	}
+
+	historyItems, _, err := unstructured.NestedSlice(obj.Object, "status", "history")
+	if err != nil {
+		klog.Errorf("failed to get history in clusterVersion: %v", err)
+	}
+	for _, historyItem := range historyItems {
+		history := clusterv1beta1.OCPVersionUpdateHistory{}
+		history.State, _, err = unstructured.NestedString(historyItem.(map[string]interface{}), "state")
+		if err != nil {
+			klog.Errorf("failed to get the state of history in clusterVersion: %v", err)
+		}
+		history.Image, _, err = unstructured.NestedString(historyItem.(map[string]interface{}), "image")
+		if err != nil {
+			klog.Errorf("failed to get the image of history in clusterVersion: %v", err)
+		}
+		history.Version, _, err = unstructured.NestedString(historyItem.(map[string]interface{}), "version")
+		if err != nil {
+			klog.Errorf("failed to get the version of history in clusterVersion: %v", err)
+		}
+		history.Verified, _, err = unstructured.NestedBool(historyItem.(map[string]interface{}), "verified")
+		if err != nil {
+			klog.Errorf("failed to get the verified of history in clusterVersion: %v", err)
+		}
+		ocpDistributionInfo.VersionHistory = append(ocpDistributionInfo.VersionHistory, history)
 	}
 
 	ocpDistributionInfo.UpgradeFailed = false
 	conditions, _, err := unstructured.NestedSlice(obj.Object, "status", "conditions")
 	if err != nil {
-		klog.Errorf("failed to get OCP cluster version in latest history of status: %v", err)
+		klog.Errorf("failed to get conditions in clusterVersion: %v", err)
 	}
 	for _, condition := range conditions {
 		conditiontype, _, err := unstructured.NestedString(condition.(map[string]interface{}), "type")
 		if err != nil {
-			klog.Errorf("failed to get OCP cluster version in latest history of status: %v", err)
+			klog.Errorf("failed to get the condition type in clusterVersion: %v", err)
 			continue
 		}
 		if conditiontype == "Failing" {
 			conditionstatus, _, err := unstructured.NestedString(condition.(map[string]interface{}), "status")
 			if err != nil {
-				klog.Errorf("failed to get OCP cluster version in latest history of status: %v", err)
+				klog.Errorf("failed to get the status of Failing condition in clusterVersion : %v", err)
 				continue
 			}
 			if conditionstatus == "True" && ocpDistributionInfo.DesiredVersion != ocpDistributionInfo.Version {
@@ -478,7 +458,64 @@ func (r *ClusterInfoReconciler) RefreshAgentServer(clusterInfo *clusterv1beta1.M
 }
 
 func (r *ClusterInfoReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	claimSource := clusterclaim.NewClusterClaimSource(r.ClaimInformer)
+	nodeSource := &nodeSource{nodeInformer: r.NodeInformer.Informer()}
 	return ctrl.NewControllerManagedBy(mgr).
+		Watches(claimSource, &clusterclaim.ClusterClaimEventHandler{}).
+		Watches(nodeSource, &nodeEventHandler{}).
 		For(&clusterv1beta1.ManagedClusterInfo{}).
 		Complete(r)
+}
+
+// nodeSource is the event source of nodes on managed cluster.
+type nodeSource struct {
+	nodeInformer cache.SharedIndexInformer
+}
+
+var _ source.SyncingSource = &nodeSource{}
+
+func (s *nodeSource) Start(ctx context.Context, handler handler.EventHandler, queue workqueue.RateLimitingInterface,
+	predicates ...predicate.Predicate) error {
+	// all predicates are ignored
+	s.nodeInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			handler.Create(event.CreateEvent{}, queue)
+		},
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			handler.Update(event.UpdateEvent{}, queue)
+		},
+		DeleteFunc: func(obj interface{}) {
+			handler.Delete(event.DeleteEvent{}, queue)
+		},
+	})
+
+	return nil
+}
+
+func (s *nodeSource) WaitForSync(ctx context.Context) error {
+	if ok := cache.WaitForCacheSync(ctx.Done(), s.nodeInformer.HasSynced); !ok {
+		return fmt.Errorf("Never achieved initial sync")
+	}
+	return nil
+}
+
+// nodeEventHandler maps any event to an empty request
+type nodeEventHandler struct{}
+
+var _ handler.EventHandler = &nodeEventHandler{}
+
+func (e *nodeEventHandler) Create(evt event.CreateEvent, q workqueue.RateLimitingInterface) {
+	q.Add(reconcile.Request{})
+}
+
+func (e *nodeEventHandler) Update(evt event.UpdateEvent, q workqueue.RateLimitingInterface) {
+	q.Add(reconcile.Request{})
+}
+
+func (e *nodeEventHandler) Delete(evt event.DeleteEvent, q workqueue.RateLimitingInterface) {
+	q.Add(reconcile.Request{})
+}
+
+func (e *nodeEventHandler) Generic(evt event.GenericEvent, q workqueue.RateLimitingInterface) {
+	q.Add(reconcile.Request{})
 }
