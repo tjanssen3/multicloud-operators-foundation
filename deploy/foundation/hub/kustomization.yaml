@@ -19,7 +19,7 @@ resources:
 images:
 - name: foundation-controller
   newName: quay.io/open-cluster-management/multicloud-manager
-  newTag: latest
+  newTag: 0.3.0
 - name: foundation-proxyserver
   newName: quay.io/open-cluster-management/multicloud-manager
   newTag: latest
