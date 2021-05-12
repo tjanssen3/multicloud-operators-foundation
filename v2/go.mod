@@ -1,6 +1,6 @@
-module github.com/tjanssen3/multicloud-operators-foundation/v2
+module github.com/tjanssen3/multicloud-operators-foundation
 
-go 1.15
+go 1.16
 
 replace k8s.io/client-go => k8s.io/client-go v0.20.0
 
