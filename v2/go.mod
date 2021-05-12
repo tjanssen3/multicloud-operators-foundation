@@ -1,4 +1,4 @@
-module github.com/tjanssen3/multicloud-operators-foundation
+module github.com/tjanssen3/multicloud-operators-foundation/v2
 
 go 1.16
 
